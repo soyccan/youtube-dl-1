@@ -3,6 +3,7 @@ from __future__ import unicode_literals
 
 import hashlib
 import re
+import json
 
 from .common import InfoExtractor
 from ..compat import (
@@ -24,8 +25,12 @@ from ..utils import (
 
 
 class BiliBiliIE(InfoExtractor):
-    _VALID_URL = r'https?://(?:www\.|bangumi\.|)bilibili\.(?:tv|com)/(?:video/av|anime/(?P<anime_id>\d+)/play#)(?P<id>\d+)'
+    _VALID_URL = r'https?://(?:www\.|bangumi\.|)bilibili\.(?:tv|com)/(?:video/av|anime/(?P<anime_id>\d+)/play#|bangumi/play/ep)(?P<id>\d+)(\?p=(?P<page>\d+))?'
 
+    # new test, full anime: https://www.bilibili.com/bangumi/play/ss28685/
+    # new test, anime single episode: https://www.bilibili.com/bangumi/play/ep285921
+    # new test, video: https://www.bilibili.com/video/av58781780
+    # new test, video with pages: https://www.bilibili.com/video/av11849?p=2
     _TESTS = [{
         'url': 'http://www.bilibili.tv/video/av1074402/',
         'md5': '5f7d29e1a2872f3df0cf76b1f87d3788',
@@ -113,16 +118,19 @@ class BiliBiliIE(InfoExtractor):
         anime_id = mobj.group('anime_id')
         webpage = self._download_webpage(url, video_id)
 
-        if 'anime/' not in url:
-            cid = self._search_regex(
-                r'\bcid(?:["\']:|=)(\d+)', webpage, 'cid',
-                default=None
-            ) or compat_parse_qs(self._search_regex(
-                [r'EmbedPlayer\([^)]+,\s*"([^"]+)"\)',
-                 r'EmbedPlayer\([^)]+,\s*\\"([^"]+)\\"\)',
-                 r'<iframe[^>]+src="https://secure\.bilibili\.com/secure,([^"]+)"'],
-                webpage, 'player parameters'))['cid'][0]
+        if 'bangumi/' not in url:
+            # common video
+            state_raw = re.search(r'__INITIAL_STATE__=(\{.*?\});', webpage)
+            state = json.loads(state_raw.group(1))
+            aid = str(state['videoData']['aid'])
+            cid = str(state['videoData']['cid'])
+
+            page = mobj.group('page')
+            if page:
+                cid = [ str(x['cid']) for x in state['videoData']['pages'] if str(x['page']) == page ][0]
+
         else:
+            # anime episode
             if 'no_bangumi_tip' not in smuggled_data:
                 self.to_screen('Downloading episode %s. To download all videos in anime %s, re-run youtube-dl with %s' % (
                     video_id, anime_id, compat_urlparse.urljoin(url, '//bangumi.bilibili.com/anime/%s' % anime_id)))
@@ -132,13 +140,12 @@ class BiliBiliIE(InfoExtractor):
             }
             headers.update(self.geo_verification_headers())
 
-            js = self._download_json(
-                'http://bangumi.bilibili.com/web_api/get_source', video_id,
-                data=urlencode_postdata({'episode_id': video_id}),
-                headers=headers)
-            if 'result' not in js:
-                self._report_error(js)
-            cid = js['result']['cid']
+            state_raw = re.search(r'__INITIAL_STATE__=(\{.*?\});', webpage)
+            state = json.loads(state_raw.group(1))
+            anime_id = str(state['mediaInfo']['id'])
+
+            cid = [ str(x['cid']) for x in state['epList'] if str(x['id']) == video_id ][0]
+            aid = [ str(x['aid']) for x in state['epList'] if str(x['id']) == video_id ][0]
 
         headers = {
             'Referer': url
@@ -147,18 +154,25 @@ class BiliBiliIE(InfoExtractor):
 
         entries = []
 
-        RENDITIONS = ('qn=80&quality=80&type=', 'quality=2&type=mp4')
-        for num, rendition in enumerate(RENDITIONS, start=1):
-            payload = 'appkey=%s&cid=%s&otype=json&%s' % (self._APP_KEY, cid, rendition)
-            sign = hashlib.md5((payload + self._BILIBILI_KEY).encode('utf-8')).hexdigest()
+        # Reference: https://greasyfork.org/zh-TW/scripts/372516-bilibili-merged-flv-mp4-ass-enhance
+        # const isBangumi = location.pathname.includes("bangumi") || location.hostname.includes("bangumi")
+        # const apiPath = isBangumi ? "/pgc/player/web/playurl" : "/x/player/playurl"
+        # const qn = (monkey.option.enableVideoMaxResolution && monkey.option.videoMaxResolution) || "120"
+        # const api_url = `https://api.bilibili.com${apiPath}?avid=${aid}&cid=${cid}&otype=json&qn=${qn}`
 
-            video_info = self._download_json(
-                'http://interface.bilibili.com/v2/playurl?%s&sign=%s' % (payload, sign),
-                video_id, note='Downloading video info page',
-                headers=headers, fatal=num == len(RENDITIONS))
+        isBangumi = 'bangumi' in url
+        apiPath = '/pgc/player/web/playurl' if isBangumi else '/x/player/playurl'
+        RENDITIONS = ('qn=120', 'qn=80&quality=80&type=', 'quality=2&type=mp4')
+        for num, rendition in enumerate(RENDITIONS, start=1):
+            api_url = f'https://api.bilibili.com{apiPath}?avid={aid}&cid={cid}&otype=json&{rendition}'
+            video_info = self._download_json(api_url, video_id)
 
             if not video_info:
                 continue
+            elif isBangumi:
+                video_info = video_info['result']
+            else:
+                video_info = video_info['data']
 
             if 'durl' not in video_info:
                 if num < len(RENDITIONS):
@@ -170,12 +184,13 @@ class BiliBiliIE(InfoExtractor):
                     'url': durl['url'],
                     'filesize': int_or_none(durl['size']),
                 }]
-                for backup_url in durl.get('backup_url', []):
-                    formats.append({
-                        'url': backup_url,
-                        # backup URLs have lower priorities
-                        'preference': -2 if 'hd.mp4' in backup_url else -3,
-                    })
+                if durl.get('backup_url'):
+                    for backup_url in durl.get('backup_url', []):
+                        formats.append({
+                            'url': backup_url,
+                            # backup URLs have lower priorities
+                            'preference': -2 if 'hd.mp4' in backup_url else -3,
+                        })
 
                 for a_format in formats:
                     a_format.setdefault('http_headers', {}).update({
@@ -243,11 +258,12 @@ class BiliBiliIE(InfoExtractor):
 
 
 class BiliBiliBangumiIE(InfoExtractor):
-    _VALID_URL = r'https?://bangumi\.bilibili\.com/anime/(?P<id>\d+)'
+    _VALID_URL = r'https?://(bangumi|www)\.bilibili\.com/(anime/|bangumi/media/md)(?P<id>\d+)'
 
     IE_NAME = 'bangumi.bilibili.com'
     IE_DESC = 'BiliBili番剧'
 
+    # new test: https://www.bilibili.com/bangumi/media/md28222851/
     _TESTS = [{
         'url': 'http://bangumi.bilibili.com/anime/1869',
         'info_dict': {
