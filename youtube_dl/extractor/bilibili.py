@@ -25,12 +25,25 @@ from ..utils import (
 
 
 class BiliBiliIE(InfoExtractor):
-    _VALID_URL = r'https?://(?:www\.|bangumi\.|)bilibili\.(?:tv|com)/(?:video/av|anime/(?P<anime_id>\d+)/play#|bangumi/play/ep)(?P<id>\d+)(\?p=(?P<page>\d+))?'
+    _VALID_URL = r'''(?x)
+                    https?://
+                        (?:(?:www|bangumi)\.)?
+                        bilibili\.(?:tv|com)/
+                        (?:
+                            (?:
+                                video/[aA][vV]|
+                                anime/(?P<anime_id>\d+)/play\#
+                            )(?P<id_bv>\d+)|
+                            video/[bB][vV](?P<id>[^/?#&]+)
+                        )
+                        \?p=(?P<page>\d+)
+                    '''
 
     # new test, full anime: https://www.bilibili.com/bangumi/play/ss28685/
     # new test, anime single episode: https://www.bilibili.com/bangumi/play/ep285921
     # new test, video: https://www.bilibili.com/video/av58781780
     # new test, video with pages: https://www.bilibili.com/video/av11849?p=2
+    # new test, video with pages: https://www.bilibili.com/video/BV1ms411F7E1?p=2
     _TESTS = [{
         'url': 'http://www.bilibili.tv/video/av1074402/',
         'md5': '5f7d29e1a2872f3df0cf76b1f87d3788',
@@ -118,6 +131,7 @@ class BiliBiliIE(InfoExtractor):
         anime_id = mobj.group('anime_id')
         webpage = self._download_webpage(url, video_id)
 
+        # TODO: See page as playlist index
         if 'bangumi/' not in url:
             # common video
             state_raw = re.search(r'__INITIAL_STATE__=(\{.*?\});', webpage)
